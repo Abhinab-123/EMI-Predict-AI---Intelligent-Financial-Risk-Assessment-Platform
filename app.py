@@ -1,66 +1,118 @@
-# Updated app.py with a safe import for plotly and a matplotlib fallback for the credit gauge.
-# Replace your existing app.py with this file (or merge the changes).
 """
-Streamlit app: EMI Predictor — EMI-Predict-AI
-Fallbacks: If plotly is not installed, a matplotlib gauge-like bar is used instead.
+Streamlit app (single-page): EMI Predictor
+
+This variant only shows the EMI Predictor UI (no multi-page sidebar).
+It supports:
+- Single applicant prediction via form inputs
+- Batch predictions from a CSV (uploaded or data/applicants.csv) using the 'best' available model found in models/
+- Heuristic fallback if no models are available
+
+How it chooses models (best-effort):
+1. Looks for explicit filenames (priority):
+   - Classifier: models/best_classifier.pkl, models/emi_classifier.pkl
+   - Regressor: models/best_regressor.pkl, models/emi_regressor.pkl
+2. If not present, scans models/*.pkl and picks the first file that can be loaded and used for .predict_proba (classifier) or .predict (regressor).
+3. If no usable model found, uses a simple heuristic fallback so the UI still works.
+
+Place trained model artifacts in models/ (e.g., joblib.dump(pipeline, "models/emi_classifier.pkl")).
 """
 import io
 import os
-import json
-from typing import Tuple
+import glob
+from typing import Tuple, Optional
 
 import pandas as pd
 import numpy as np
 import streamlit as st
 
-# Optional plotting libraries
+# optional plotting libs
 try:
     import plotly.graph_objects as go
     PLOTLY_AVAILABLE = True
 except Exception:
     PLOTLY_AVAILABLE = False
 
-import seaborn as sns
 import matplotlib.pyplot as plt
+import seaborn as sns
 
-from sklearn.metrics import (
-    accuracy_score,
-    precision_score,
-    recall_score,
-    f1_score,
-    confusion_matrix,
-    roc_curve,
-    auc,
-)
 import joblib
-
-# ---------------------------------------------------------------------
-# Utils: load models, helpers
-# ---------------------------------------------------------------------
-MODEL_CLASS_PATH = "models/emi_classifier.pkl"
-MODEL_REG_PATH = "models/emi_regressor.pkl"
-DEFAULT_DATA_PATH = "data/applicants.csv"
-METRICS_PATH = "models/metrics.json"  # optional saved metrics from training / MLflow export
 
 st.set_page_config(page_title="EMI Predictor", layout="wide")
 
+# Constants
+MODEL_DIR = "models"
+DEFAULT_DATA_PATH = "data/applicants.csv"
+EXPECTED_COLS = [
+    "monthly_salary",
+    "current_emi",
+    "requested_loan_amount",
+    "loan_tenure_months",
+    "credit_score",
+    "employment_years",
+    "expenses_total",
+]
 
-@st.cache_resource
-def load_model(path: str):
-    if os.path.exists(path):
-        try:
-            model = joblib.load(path)
+
+# -----------------------
+# Model discovery & load
+# -----------------------
+def try_load(path: str):
+    try:
+        m = joblib.load(path)
+        return m
+    except Exception:
+        return None
+
+
+def find_classifier_model() -> Optional[object]:
+    # priority names
+    candidates = [
+        os.path.join(MODEL_DIR, "best_classifier.pkl"),
+        os.path.join(MODEL_DIR, "emi_classifier.pkl"),
+    ]
+    # add any pkl in models/
+    candidates += sorted(glob.glob(os.path.join(MODEL_DIR, "*.pkl")))
+    seen = set()
+    for c in candidates:
+        if not c or c in seen:
+            continue
+        seen.add(c)
+        model = try_load(c)
+        if model is None:
+            continue
+        # check for predict_proba or predict as a fallback
+        if hasattr(model, "predict_proba") or hasattr(model, "predict"):
             return model
-        except Exception as e:
-            st.warning(f"Failed to load model at {path}: {e}")
-            return None
     return None
 
 
-clf_model = load_model(MODEL_CLASS_PATH)
-reg_model = load_model(MODEL_REG_PATH)
+def find_regressor_model() -> Optional[object]:
+    candidates = [
+        os.path.join(MODEL_DIR, "best_regressor.pkl"),
+        os.path.join(MODEL_DIR, "emi_regressor.pkl"),
+    ]
+    candidates += sorted(glob.glob(os.path.join(MODEL_DIR, "*.pkl")))
+    seen = set()
+    for c in candidates:
+        if not c or c in seen:
+            continue
+        seen.add(c)
+        model = try_load(c)
+        if model is None:
+            continue
+        # prefer something that has predict
+        if hasattr(model, "predict"):
+            return model
+    return None
 
 
+CLF_MODEL = find_classifier_model()
+REG_MODEL = find_regressor_model()
+
+
+# -----------------------
+# Heuristic fallback
+# -----------------------
 def heuristic_predict(inputs: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     credit = inputs["credit_score"].values
     salary = inputs["monthly_salary"].values
@@ -72,9 +124,9 @@ def heuristic_predict(inputs: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.
     prob = []
     pred = []
     for c, s, cur, req, t, exp in zip(credit, salary, current_emi, requested, tenure, expenses):
-        affordability = s * 0.4 - (cur + exp)
-        score_factor = (c - 600) / 400
+        affordability = s * 0.35 - (cur + exp)
         per_month_req = req / max(1, t)
+        score_factor = (c - 600) / 400  # scaled shift by credit
         raw = 0.5 * (affordability / max(1.0, per_month_req) + score_factor)
         p = float(np.clip(raw, 0.05, 0.99))
         prob.append(p)
@@ -87,65 +139,67 @@ def heuristic_predict(inputs: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.
 
     prob = np.array(prob)
     pred = np.array(pred)
-
     max_emi = np.maximum(0, salary * 0.35 - expenses)
     return pred, prob, max_emi
 
 
-def preprocess_input(single_input: dict) -> pd.DataFrame:
-    df = pd.DataFrame([single_input])
-    expected_cols = [
-        "monthly_salary",
-        "current_emi",
-        "requested_loan_amount",
-        "loan_tenure_months",
-        "credit_score",
-        "employment_years",
-        "expenses_total",
-    ]
-    for c in expected_cols:
-        if c not in df:
+# -----------------------
+# Preprocessing helpers
+# -----------------------
+def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
+    for c in EXPECTED_COLS:
+        if c not in df.columns:
             df[c] = 0
-    return df[expected_cols]
+    return df[EXPECTED_COLS]
 
 
 def classify_and_regress(df: pd.DataFrame):
-    if clf_model is not None:
+    df_proc = ensure_columns(df.copy())
+
+    # classifier
+    if CLF_MODEL is not None:
         try:
-            probs = clf_model.predict_proba(df)[:, 1]
+            if hasattr(CLF_MODEL, "predict_proba"):
+                probs = CLF_MODEL.predict_proba(df_proc)
+                # if binary, take column 1; if multi, attempt to map a positive class
+                if probs.ndim == 2 and probs.shape[1] >= 2:
+                    probs = probs[:, 1]
+                else:
+                    # fallback to sum over last axis / normalize
+                    probs = np.mean(probs, axis=1)
+            else:
+                # no predict_proba: use predict and map to probability 0.9/0.1
+                pred_labels = CLF_MODEL.predict(df_proc)
+                probs = np.array([0.9 if p in (1, "Eligible", "eligible") else 0.1 for p in pred_labels])
             labels = np.where(probs >= 0.7, "Eligible", np.where(probs >= 0.4, "High Risk", "Not Eligible"))
         except Exception:
-            labels, probs, _ = heuristic_predict(df)
+            labels, probs, _ = heuristic_predict(df_proc)
     else:
-        labels, probs, _ = heuristic_predict(df)
+        labels, probs, _ = heuristic_predict(df_proc)
 
-    if reg_model is not None:
+    # regressor
+    if REG_MODEL is not None:
         try:
-            max_emi = reg_model.predict(df)
-            max_emi = np.maximum(0, max_emi)
+            max_emi = REG_MODEL.predict(df_proc)
+            max_emi = np.maximum(0, np.array(max_emi).astype(float))
         except Exception:
-            _, probs, max_emi = heuristic_predict(df)
+            _, probs, max_emi = heuristic_predict(df_proc)
     else:
-        _, probs, max_emi = heuristic_predict(df)
+        _, probs, max_emi = heuristic_predict(df_proc)
 
     return labels, probs, max_emi
 
 
-# ---------------------------------------------------------------------
+# -----------------------
 # UI components
-# ---------------------------------------------------------------------
+# -----------------------
 def render_gauge(credit_score: float, prob: float):
-    """
-    If plotly is available draw an Indicator gauge. Otherwise draw a simple matplotlib horizontal bar
-    as a fallback to avoid ImportError on Streamlit deployment.
-    """
     if PLOTLY_AVAILABLE:
         fig = go.Figure(go.Indicator(
             mode="gauge+number",
             value=credit_score,
-            number={'suffix': ""},
             domain={'x': [0, 1], 'y': [0, 1]},
-            title={'text': f"Credit Score (Probability: {prob:.2f})"},
+            title={'text': f"Credit Score (Prob: {prob:.2f})"},
             gauge={
                 'axis': {'range': [300, 900]},
                 'bar': {'color': "darkblue"},
@@ -160,14 +214,11 @@ def render_gauge(credit_score: float, prob: float):
         ))
         st.plotly_chart(fig, use_container_width=True)
     else:
-        # Matplotlib fallback: horizontal bar scaled between 300 and 900
         min_score, max_score = 300, 900
         frac = (credit_score - min_score) / (max_score - min_score)
         frac = float(np.clip(frac, 0.0, 1.0))
-
         fig, ax = plt.subplots(figsize=(6, 1.2))
         ax.barh([0], [frac], color="tab:blue", height=0.5)
-        ax.barh([0], [1.0], color="#e9ecef", height=0.5, left=0)  # background
         ax.set_xlim(0, 1)
         ax.set_yticks([])
         ax.set_xticks([0.0, 0.25, 0.5, 0.75, 1.0])
@@ -186,21 +237,21 @@ def show_prediction_card(label: str, max_emi: float, prob: float):
         emoji = "⚠️"
     else:
         emoji = "❌"
-
     st.markdown(f"### Result: {emoji}  {label}")
     st.write(f"Recommended maximum EMI:  ₹{max_emi:.2f}")
     st.write(f"Probability (model):  {prob:.2f}")
 
 
-# ---------------------------------------------------------------------
-# Pages (unchanged logic)
-# ---------------------------------------------------------------------
-def page_predict():
+# -----------------------
+# Main page (single-page app)
+# -----------------------
+def main():
     st.title("🏠 EMI Predictor")
+    st.write("Single-page app: use the form below for one-off prediction or upload a CSV for batch predictions.")
 
-    c1, c2 = st.columns([2, 1])
-    with c1:
-        st.subheader("Applicant inputs")
+    # single prediction form
+    with st.form(key="single_form"):
+        st.subheader("Single applicant prediction")
         monthly_salary = st.number_input("Monthly salary (₹)", min_value=0.0, value=30000.0, step=1000.0)
         current_emi = st.number_input("Current EMI amount (₹)", min_value=0.0, value=5000.0, step=500.0)
         requested_loan_amount = st.number_input("Requested loan amount (₹)", min_value=0.0, value=200000.0, step=10000.0)
@@ -213,42 +264,49 @@ def page_predict():
         other_expenses = st.number_input("Other monthly expenses (₹)", min_value=0.0, value=2000.0, step=100.0)
 
         expenses_total = rent + travel + school + other_expenses
-        st.write("Total monthly expenses (entered):", expenses_total)
+        st.write("Total monthly expenses (entered):", int(expenses_total))
 
-        if st.button("Predict Eligibility"):
-            single = {
-                "monthly_salary": monthly_salary,
-                "current_emi": current_emi,
-                "requested_loan_amount": requested_loan_amount,
-                "loan_tenure_months": loan_tenure_months,
-                "credit_score": credit_score,
-                "employment_years": employment_years,
-                "expenses_total": expenses_total,
-            }
-            df_in = preprocess_input(single)
-            labels, probs, max_emi = classify_and_regress(df_in)
-            label = labels[0]
-            prob = float(probs[0])
-            recommended = float(max_emi[0])
+        submit_btn = st.form_submit_button("Predict Eligibility")
 
-            c3, c4 = st.columns([1, 1])
-            with c3:
-                show_prediction_card(label, recommended, prob)
-            with c4:
-                render_gauge(credit_score, prob)
+    if submit_btn:
+        single = {
+            "monthly_salary": monthly_salary,
+            "current_emi": current_emi,
+            "requested_loan_amount": requested_loan_amount,
+            "loan_tenure_months": loan_tenure_months,
+            "credit_score": credit_score,
+            "employment_years": employment_years,
+            "expenses_total": expenses_total,
+        }
+        df_in = pd.DataFrame([single])
+        labels, probs, max_emi = classify_and_regress(df_in)
+        label = labels[0]
+        prob = float(probs[0])
+        recommended = float(max_emi[0])
 
-            st.subheader("Prediction details")
-            st.json({
-                "label": label,
-                "probability": prob,
-                "recommended_max_emi": recommended,
-                "input_summary": single
-            })
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            show_prediction_card(label, recommended, prob)
+        with c2:
+            render_gauge(credit_score, prob)
 
+        st.subheader("Prediction details")
+        st.json({
+            "label": label,
+            "probability": prob,
+            "recommended_max_emi": recommended,
+            "input_summary": single
+        })
 
-def page_explore():
-    st.title("📊 Data Exploration")
-    uploaded = st.file_uploader("Upload applicants CSV (optional)", type=["csv", "xlsx"])
+    st.markdown("---")
+    st.subheader("Batch predictions from CSV")
+
+    uploaded = st.file_uploader("Upload applicants CSV (columns matching: monthly_salary,current_emi,requested_loan_amount,loan_tenure_months,credit_score,employment_years,expenses_total)", type=["csv", "xlsx"])
+    use_default = False
+    if uploaded is None and os.path.exists(DEFAULT_DATA_PATH):
+        if st.checkbox(f"Use default CSV at {DEFAULT_DATA_PATH}"):
+            use_default = True
+
     df = None
     if uploaded is not None:
         try:
@@ -259,226 +317,65 @@ def page_explore():
             st.success(f"Loaded {uploaded.name} with {len(df)} rows")
         except Exception as e:
             st.error(f"Failed to read uploaded file: {e}")
-            return
-    else:
-        if os.path.exists(DEFAULT_DATA_PATH):
-            try:
-                df = pd.read_csv(DEFAULT_DATA_PATH)
-                st.info(f"Using {DEFAULT_DATA_PATH} with {len(df)} rows")
-            except Exception as e:
-                st.warning(f"Failed to load {DEFAULT_DATA_PATH}: {e}")
-
-    if df is None or df.empty:
-        st.write("No dataset available. Upload a CSV or place one at data/applicants.csv.")
-        return
-
-    st.dataframe(df.head(50))
-
-    if "eligibility" in df.columns:
-        avg_salary = df.groupby("eligibility")["monthly_salary"].mean().reset_index()
-        st.subheader("Average salary by eligibility")
-        st.bar_chart(avg_salary.rename(columns={"monthly_salary": "avg_monthly_salary"}).set_index("eligibility"))
-    else:
-        st.info("No 'eligibility' column found in dataset; charts will use computed estimates where possible.")
-
-    st.subheader("Credit score distribution")
-    if "credit_score" in df.columns:
-        st.bar_chart(df["credit_score"].value_counts().sort_index())
-    else:
-        st.write("No credit_score column available.")
-
-    numeric = df.select_dtypes(include=[np.number])
-    if numeric.shape[1] >= 2:
-        st.subheader("Correlation heatmap")
-        fig, ax = plt.subplots(figsize=(8, 6))
-        sns.heatmap(numeric.corr(), annot=True, fmt=".2f", cmap="coolwarm", ax=ax)
-        st.pyplot(fig)
-    else:
-        st.info("Not enough numeric columns for correlation heatmap.")
-
-
-def page_metrics():
-    st.title("⚙️ Model Metrics")
-    metrics = None
-    if os.path.exists(METRICS_PATH):
+            df = None
+    elif use_default:
         try:
-            with open(METRICS_PATH) as f:
-                metrics = json.load(f)
-        except Exception:
-            metrics = None
+            df = pd.read_csv(DEFAULT_DATA_PATH)
+            st.info(f"Using {DEFAULT_DATA_PATH} with {len(df)} rows")
+        except Exception as e:
+            st.error(f"Failed to load default CSV: {e}")
+            df = None
 
-    if metrics:
-        st.subheader("Saved metrics")
-        st.json(metrics)
-        if "confusion_matrix" in metrics:
-            cm = np.array(metrics["confusion_matrix"])
-            fig, ax = plt.subplots()
-            sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax)
-            ax.set_xlabel("Predicted")
-            ax.set_ylabel("Actual")
-            st.pyplot(fig)
-    else:
-        st.info("No saved metrics found at models/metrics.json. You can upload a labeled test CSV to compute metrics.")
-
-    uploaded = st.file_uploader("Upload labeled test CSV (must contain 'label' column)", type=["csv", "xlsx"], key="metrics_upload")
-    if uploaded is None:
-        return
-    try:
-        if uploaded.name.endswith(".xlsx"):
-            test_df = pd.read_excel(uploaded)
-        else:
-            test_df = pd.read_csv(uploaded)
-    except Exception as e:
-        st.error(f"Failed to read uploaded file: {e}")
-        return
-
-    if "label" not in test_df.columns:
-        st.error("Uploaded CSV must contain a 'label' column with ground-truth labels (Eligible / Not Eligible / High Risk).")
-        return
-
-    cols = [
-        "monthly_salary",
-        "current_emi",
-        "requested_loan_amount",
-        "loan_tenure_months",
-        "credit_score",
-        "employment_years",
-        "expenses_total",
-    ]
-    for c in cols:
-        if c not in test_df.columns:
-            test_df[c] = 0
-
-    X = test_df[cols]
-    y_true = test_df["label"].values
-
-    labels, probs, _ = classify_and_regress(X)
-    y_pred = labels
-
-    acc = accuracy_score(y_true, y_pred)
-    prec = precision_score(y_true, y_pred, average="macro", zero_division=0)
-    rec = recall_score(y_true, y_pred, average="macro", zero_division=0)
-    f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
-
-    st.subheader("Computed metrics")
-    st.write(f"Accuracy: {acc:.3f}")
-    st.write(f"Precision (macro): {prec:.3f}")
-    st.write(f"Recall (macro): {rec:.3f}")
-    st.write(f"F1-score (macro): {f1:.3f}")
-
-    cm = confusion_matrix(y_true, y_pred, labels=np.unique(y_true))
-    fig, ax = plt.subplots()
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax,
-                xticklabels=np.unique(y_true), yticklabels=np.unique(y_true))
-    ax.set_xlabel("Predicted")
-    ax.set_ylabel("Actual")
-    st.pyplot(fig)
-
-    if clf_model is not None:
-        try:
-            if len(np.unique(y_true)) == 2:
-                y_bin = (y_true == np.unique(y_true)[1]).astype(int)
-                y_score = clf_model.predict_proba(X)[:, 1]
-                fpr, tpr, _ = roc_curve(y_bin, y_score)
-                roc_auc = auc(fpr, tpr)
-                fig2, ax2 = plt.subplots()
-                ax2.plot(fpr, tpr, label=f"AUC = {roc_auc:.2f}")
-                ax2.plot([0, 1], [0, 1], linestyle="--")
-                ax2.set_xlabel("False Positive Rate")
-                ax2.set_ylabel("True Positive Rate")
-                ax2.set_title("ROC Curve")
-                ax2.legend()
-                st.pyplot(fig2)
-        except Exception:
-            st.info("ROC curve not available for current classifier or labels.")
-
-
-def page_admin():
-    st.title("👨‍💻 Admin / Data Upload")
-
-    st.markdown("Upload a CSV of applicants, preview, run batch predictions & download results.")
-
-    uploaded = st.file_uploader("Upload applicants CSV", type=["csv", "xlsx"], key="admin_upload")
-    if uploaded is None:
-        st.info("No file uploaded. You can place a CSV at data/applicants.csv to use as default.")
-        return
-
-    try:
-        if uploaded.name.endswith(".xlsx"):
-            df = pd.read_excel(uploaded)
-        else:
-            df = pd.read_csv(uploaded)
-    except Exception as e:
-        st.error(f"Failed to read uploaded file: {e}")
-        return
-
-    st.write(f"Loaded {len(df)} rows")
-    st.dataframe(df.head(200))
-
-    cols = [
-        "monthly_salary",
-        "current_emi",
-        "requested_loan_amount",
-        "loan_tenure_months",
-        "credit_score",
-        "employment_years",
-        "expenses_total",
-    ]
-    for c in cols:
-        if c not in df.columns:
-            df[c] = 0
-
-    if st.button("Run batch predictions"):
-        labels, probs, max_emi = classify_and_regress(df[cols])
-        df["predicted_label"] = labels
-        df["predicted_probability"] = probs
-        df["recommended_max_emi"] = max_emi
-
-        st.success("Batch predictions added to dataframe.")
+    if df is not None:
         st.dataframe(df.head(200))
 
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="predictions")
-        buf.seek(0)
-        st.download_button(
-            label="Download predictions as Excel",
-            data=buf,
-            file_name="predictions.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-        st.download_button(
-            label="Download predictions as CSV",
-            data=df.to_csv(index=False).encode("utf-8"),
-            file_name="predictions.csv",
-            mime="text/csv",
-        )
+        if st.button("Run batch predictions on this CSV"):
+            # ensure features exist
+            df_proc = ensure_columns(df.copy())
+            labels, probs, max_emi = classify_and_regress(df_proc)
+            df["predicted_label"] = labels
+            df["predicted_probability"] = probs
+            df["recommended_max_emi"] = max_emi
 
-    if st.button("Save uploaded file to data/applicants.csv"):
+            st.success("Batch predictions completed.")
+            st.dataframe(df.head(200))
+
+            # downloads
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                df.to_excel(writer, index=False, sheet_name="predictions")
+            buf.seek(0)
+            st.download_button(
+                label="Download predictions as Excel",
+                data=buf,
+                file_name="predictions.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            st.download_button(
+                label="Download predictions as CSV",
+                data=df.to_csv(index=False).encode("utf-8"),
+                file_name="predictions.csv",
+                mime="text/csv",
+            )
+
+    # show which models were selected (for transparency)
+    st.markdown("---")
+    st.write("Model selection summary:")
+    st.write(f"Classifier loaded: {'Yes' if CLF_MODEL is not None else 'No'}")
+    if CLF_MODEL is not None:
         try:
-            save_path = DEFAULT_DATA_PATH
-            df.to_csv(save_path, index=False)
-            st.success(f"Saved to {save_path}")
-        except Exception as e:
-            st.error(f"Failed to save file: {e}")
+            st.write(f"Classifier type: {type(CLF_MODEL)}")
+            st.write(f"Has predict_proba: {hasattr(CLF_MODEL, 'predict_proba')}")
+        except Exception:
+            pass
+    st.write(f"Regressor loaded: {'Yes' if REG_MODEL is not None else 'No'}")
+    if REG_MODEL is not None:
+        try:
+            st.write(f"Regressor type: {type(REG_MODEL)}")
+        except Exception:
+            pass
 
-
-# ---------------------------------------------------------------------
-# Router
-# ---------------------------------------------------------------------
-def main():
-    st.sidebar.title("EMI Predictor")
-    page = st.sidebar.radio("Go to", ["EMI Predictor", "Data Exploration", "Model Metrics", "Admin / Data Upload"])
-
-    if page == "EMI Predictor":
-        page_predict()
-    elif page == "Data Exploration":
-        page_explore()
-    elif page == "Model Metrics":
-        page_metrics()
-    elif page == "Admin / Data Upload":
-        page_admin()
-
+    st.caption("Tip: Put trained models in the models/ folder (e.g. models/emi_classifier.pkl and models/emi_regressor.pkl). If you want the app to automatically choose a 'best' artifact, name it models/best_classifier.pkl and models/best_regressor.pkl.")
 
 if __name__ == "__main__":
     main()
