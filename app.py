@@ -1,25 +1,9 @@
+# Updated app.py with a safe import for plotly and a matplotlib fallback for the credit gauge.
+# Replace your existing app.py with this file (or merge the changes).
 """
 Streamlit app: EMI Predictor — EMI-Predict-AI
-
-Pages:
-- EMI Predictor
-- Data Exploration
-- Model Metrics
-- Admin / Data Upload
-
-How to run:
-- pip install streamlit pandas scikit-learn plotly seaborn openpyxl joblib
-- streamlit run app.py
-
-Notes:
-- Place trained models (classification + regression) at:
-    models/emi_classifier.pkl
-    models/emi_regressor.pkl
-  The code will gracefully fall back to a simple heuristic if not found.
-- Provide a dataset at data/applicants.csv for exploration (optional).
-- Optional saved metrics can live at models/metrics.json
+Fallbacks: If plotly is not installed, a matplotlib gauge-like bar is used instead.
 """
-
 import io
 import os
 import json
@@ -28,7 +12,14 @@ from typing import Tuple
 import pandas as pd
 import numpy as np
 import streamlit as st
-import plotly.graph_objects as go
+
+# Optional plotting libraries
+try:
+    import plotly.graph_objects as go
+    PLOTLY_AVAILABLE = True
+except Exception:
+    PLOTLY_AVAILABLE = False
+
 import seaborn as sns
 import matplotlib.pyplot as plt
 
@@ -41,7 +32,6 @@ from sklearn.metrics import (
     roc_curve,
     auc,
 )
-
 import joblib
 
 # ---------------------------------------------------------------------
@@ -72,11 +62,6 @@ reg_model = load_model(MODEL_REG_PATH)
 
 
 def heuristic_predict(inputs: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Simple fallback classifier/regressor when models are not available.
-    Classifier: produce a probability based on affordability and credit score.
-    Regressor: recommend max_emi = max(0, salary * 0.35 - expenses)
-    """
     credit = inputs["credit_score"].values
     salary = inputs["monthly_salary"].values
     current_emi = inputs["current_emi"].values
@@ -88,9 +73,7 @@ def heuristic_predict(inputs: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.
     pred = []
     for c, s, cur, req, t, exp in zip(credit, salary, current_emi, requested, tenure, expenses):
         affordability = s * 0.4 - (cur + exp)
-        # score factor shifts probability by credit
-        score_factor = (c - 600) / 400  # roughly maps 200->-1, 600->0, 900->0.75
-        # compare affordability to per-month requested repayment
+        score_factor = (c - 600) / 400
         per_month_req = req / max(1, t)
         raw = 0.5 * (affordability / max(1.0, per_month_req) + score_factor)
         p = float(np.clip(raw, 0.05, 0.99))
@@ -105,7 +88,7 @@ def heuristic_predict(inputs: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.
     prob = np.array(prob)
     pred = np.array(pred)
 
-    max_emi = np.maximum(0, salary * 0.35 - expenses)  # conservative recommendation
+    max_emi = np.maximum(0, salary * 0.35 - expenses)
     return pred, prob, max_emi
 
 
@@ -127,10 +110,8 @@ def preprocess_input(single_input: dict) -> pd.DataFrame:
 
 
 def classify_and_regress(df: pd.DataFrame):
-    # Try classifier
     if clf_model is not None:
         try:
-            # predict_proba expected; fallback if fails
             probs = clf_model.predict_proba(df)[:, 1]
             labels = np.where(probs >= 0.7, "Eligible", np.where(probs >= 0.4, "High Risk", "Not Eligible"))
         except Exception:
@@ -138,7 +119,6 @@ def classify_and_regress(df: pd.DataFrame):
     else:
         labels, probs, _ = heuristic_predict(df)
 
-    # Try regressor
     if reg_model is not None:
         try:
             max_emi = reg_model.predict(df)
@@ -155,25 +135,48 @@ def classify_and_regress(df: pd.DataFrame):
 # UI components
 # ---------------------------------------------------------------------
 def render_gauge(credit_score: float, prob: float):
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number",
-        value=credit_score,
-        number={'suffix': ""},
-        domain={'x': [0, 1], 'y': [0, 1]},
-        title={'text': f"Credit Score (Prob: {prob:.2f})"},
-        gauge={
-            'axis': {'range': [300, 900]},
-            'bar': {'color': "darkblue"},
-            'steps': [
-                {'range': [300, 579], 'color': "red"},
-                {'range': [580, 669], 'color': "orange"},
-                {'range': [670, 739], 'color': "yellow"},
-                {'range': [740, 799], 'color': "lightgreen"},
-                {'range': [800, 900], 'color': "green"},
-            ],
-        }
-    ))
-    st.plotly_chart(fig, use_container_width=True)
+    """
+    If plotly is available draw an Indicator gauge. Otherwise draw a simple matplotlib horizontal bar
+    as a fallback to avoid ImportError on Streamlit deployment.
+    """
+    if PLOTLY_AVAILABLE:
+        fig = go.Figure(go.Indicator(
+            mode="gauge+number",
+            value=credit_score,
+            number={'suffix': ""},
+            domain={'x': [0, 1], 'y': [0, 1]},
+            title={'text': f"Credit Score (Probability: {prob:.2f})"},
+            gauge={
+                'axis': {'range': [300, 900]},
+                'bar': {'color': "darkblue"},
+                'steps': [
+                    {'range': [300, 579], 'color': "red"},
+                    {'range': [580, 669], 'color': "orange"},
+                    {'range': [670, 739], 'color': "yellow"},
+                    {'range': [740, 799], 'color': "lightgreen"},
+                    {'range': [800, 900], 'color': "green"},
+                ],
+            }
+        ))
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        # Matplotlib fallback: horizontal bar scaled between 300 and 900
+        min_score, max_score = 300, 900
+        frac = (credit_score - min_score) / (max_score - min_score)
+        frac = float(np.clip(frac, 0.0, 1.0))
+
+        fig, ax = plt.subplots(figsize=(6, 1.2))
+        ax.barh([0], [frac], color="tab:blue", height=0.5)
+        ax.barh([0], [1.0], color="#e9ecef", height=0.5, left=0)  # background
+        ax.set_xlim(0, 1)
+        ax.set_yticks([])
+        ax.set_xticks([0.0, 0.25, 0.5, 0.75, 1.0])
+        ax.set_xticklabels([str(min_score), str(int(min_score + 0.25*(max_score-min_score))),
+                            str(int(min_score + 0.5*(max_score-min_score))),
+                            str(int(min_score + 0.75*(max_score-min_score))),
+                            str(max_score)])
+        ax.set_title(f"Credit Score: {credit_score} (Prob: {prob:.2f})")
+        st.pyplot(fig)
 
 
 def show_prediction_card(label: str, max_emi: float, prob: float):
@@ -190,7 +193,7 @@ def show_prediction_card(label: str, max_emi: float, prob: float):
 
 
 # ---------------------------------------------------------------------
-# Pages
+# Pages (unchanged logic)
 # ---------------------------------------------------------------------
 def page_predict():
     st.title("🏠 EMI Predictor")
@@ -245,7 +248,6 @@ def page_predict():
 
 def page_explore():
     st.title("📊 Data Exploration")
-
     uploaded = st.file_uploader("Upload applicants CSV (optional)", type=["csv", "xlsx"])
     df = None
     if uploaded is not None:
@@ -297,7 +299,6 @@ def page_explore():
 
 def page_metrics():
     st.title("⚙️ Model Metrics")
-
     metrics = None
     if os.path.exists(METRICS_PATH):
         try:
